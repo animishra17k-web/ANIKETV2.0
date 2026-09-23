@@ -16,13 +16,13 @@ Return ONLY the requested JSON object."""
 # Task -> preferred Gemini model (free-tier first)
 # Lightweight tasks use Flash-Lite; reasoning tasks use Flash.
 _GEMINI_TASK_MODELS = {
-    "extract": "gemini-2.5-flash-lite",
-    "flashcard": "gemini-2.5-flash-lite",
-    "teach": "gemini-2.5-flash",
-    "question": "gemini-2.5-flash",
-    "validate": "gemini-2.5-flash",
-    "evaluate": "gemini-2.5-flash",
-    "default": "gemini-2.5-flash",
+    "extract": "gemini-3.5-flash-lite",
+    "flashcard": "gemini-3.5-flash-lite",
+    "teach": "gemini-3.8-flash",
+    "question": "gemini-3.8-flash",
+    "validate": "gemini-3.8-flash",
+    "evaluate": "gemini-3.8-flash",
+    "default": "gemini-3.8-flash",
 }
 
 
@@ -114,10 +114,20 @@ def _call_gemini(prompt, task=None, schema=None):
         json=body,
         timeout=600,
     )
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"Gemini API error {r.status_code}: {r.text[:1000]}")
     data = r.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(text)
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini returned no candidates: {json.dumps(data)[:1000]}")
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text = next((p.get("text") for p in parts if p.get("text")), None)
+    if not text:
+        raise RuntimeError(f"Gemini returned no text: {json.dumps(data)[:1000]}")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Gemini returned invalid JSON: {text[:1000]}") from exc
 
 
 def ask(prompt, schema_name=None, schema=None, task=None):
@@ -140,6 +150,59 @@ def ask(prompt, schema_name=None, schema=None, task=None):
     )
 
 
+# JSON Schemas used by Gemini/OpenAI structured output.
+_SCHEMA = {
+    "extract": {"type": "object", "properties": {
+        "concepts": {"type": "array", "items": {"type": "object", "properties": {
+            "label": {"type": "string"}, "kind": {"type": "string"},
+            "content": {"type": "string"}, "source_ref": {"type": "string"}
+        }, "required": ["label", "kind", "content", "source_ref"], "additionalProperties": False}}
+    }, "required": ["concepts"], "additionalProperties": False},
+    "teach": {"type": "object", "properties": {
+        "notes": {"type": "array", "items": {"type": "string"}},
+        "question_map": {"type": "array", "items": {"type": "object", "properties": {
+            "difficulty": {"type": "string", "enum": ["easy", "moderate", "advanced"]},
+            "pattern": {"type": "string"}, "recognition": {"type": "string"}, "trap": {"type": "string"}
+        }, "required": ["difficulty", "pattern", "recognition", "trap"], "additionalProperties": False}},
+        "traps": {"type": "array", "items": {"type": "string"}},
+        "external_additions": {"type": "array", "items": {"type": "string"}}
+    }, "required": ["notes", "question_map", "traps", "external_additions"], "additionalProperties": False},
+    "flashcard": {"type": "object", "properties": {
+        "cards": {"type": "array", "items": {"type": "object", "properties": {
+            "front": {"type": "string"}, "back": {"type": "string"},
+            "source_ref": {"type": "string"}, "concept_label": {"type": "string"}
+        }, "required": ["front", "back", "source_ref", "concept_label"], "additionalProperties": False}}
+    }, "required": ["cards"], "additionalProperties": False},
+    "question": {"type": "object", "properties": {
+        "questions": {"type": "array", "items": {"type": "object", "properties": {
+            "difficulty": {"type": "string", "enum": ["easy", "moderate", "advanced"]},
+            "qtype": {"type": "string"}, "prompt": {"type": "string"},
+            "options": {"type": "array", "items": {"type": "string"}},
+            "answer": {"type": "string"}, "explanation": {"type": "string"}, "source_ref": {"type": "string"}
+        }, "required": ["difficulty", "qtype", "prompt", "options", "answer", "explanation", "source_ref"], "additionalProperties": False}}
+    }, "required": ["questions"], "additionalProperties": False},
+    "validate": {"type": "object", "properties": {
+        "valid": {"type": "boolean"},
+        "issues": {"type": "array", "items": {"type": "object", "properties": {
+            "type": {"type": "string"}, "item": {"type": "string"},
+            "severity": {"type": "string", "enum": ["high", "medium", "low"]}, "fix": {"type": "string"}
+        }, "required": ["type", "item", "severity", "fix"], "additionalProperties": False}}
+    }, "required": ["valid", "issues"], "additionalProperties": False},
+    "evaluate": {"type": "object", "properties": {
+        "items": {"type": "array", "items": {"type": "object", "properties": {
+            "question_id": {"type": "integer"}, "correct": {"type": "boolean"},
+            "error_type": {"type": "string"}, "error_detail": {"type": "string"}, "repair_skill": {"type": "string"}
+        }, "required": ["question_id", "correct", "error_type", "error_detail", "repair_skill"], "additionalProperties": False}},
+        "weaknesses": {"type": "array", "items": {"type": "object", "properties": {
+            "label": {"type": "string"}, "severity": {"type": "integer"}, "reason": {"type": "string"}
+        }, "required": ["label", "severity", "reason"], "additionalProperties": False}},
+        "repair_actions": {"type": "array", "items": {"type": "object", "properties": {
+            "action": {"type": "string"}, "priority": {"type": "string", "enum": ["high", "medium", "low"]}
+        }, "required": ["action", "priority"], "additionalProperties": False}}
+    }, "required": ["items", "weaknesses", "repair_actions"], "additionalProperties": False}
+}
+
+
 def build_extract(source, subject, topic):
     return ask(
         f"""LAYER: EXTRACT
@@ -153,6 +216,8 @@ Return:
 {{"concepts":[{{"label":"","kind":"rule|formula|fact|definition|exception|method|distinction",
 "content":"","source_ref":""}}]}}""",
         task="extract",
+        schema_name="extract",
+        schema=_SCHEMA["extract"],
     )
 
 
@@ -168,6 +233,8 @@ Return:
 {{"notes":[], "question_map":[{{"difficulty":"easy|moderate|advanced",
 "pattern":"","recognition":"","trap":""}}], "traps":[], "external_additions":[]}}""",
         task="teach",
+        schema_name="teach",
+        schema=_SCHEMA["teach"],
     )
 
 
@@ -183,6 +250,8 @@ NOTES:
 Create 30-100 high-value recall cards. One focused fact/rule per card.
 Return {{"cards":[{{"front":"","back":"","source_ref":"","concept_label":""}}]}}""",
         task="flashcard",
+        schema_name="flashcard",
+        schema=_SCHEMA["flashcard"],
     )
 
 
@@ -202,6 +271,8 @@ Return:
 {{"questions":[{{"difficulty":"easy|moderate|advanced","qtype":"",
 "prompt":"","options":[],"answer":"","explanation":"","source_ref":""}}]}}""",
         task="question",
+        schema_name="question",
+        schema=_SCHEMA["question"],
     )
 
 
@@ -216,6 +287,8 @@ overly trivial cards, and source-traceability problems.
 Return:
 {{"valid":true,"issues":[{{"type":"","item":"","severity":"high|medium|low","fix":""}}]}}""",
         task="validate",
+        schema_name="validate",
+        schema=_SCHEMA["validate"],
     )
 
 
@@ -242,4 +315,6 @@ Error types: concept_gap, recall_gap, formula_rule_gap, application_error,
 misread_question, calculation_error, careless_error, vocabulary_gap,
 fact_gap, time_pressure, guessing, other.""",
         task="evaluate",
+        schema_name="evaluate",
+        schema=_SCHEMA["evaluate"],
     )
